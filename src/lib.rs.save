@@ -1,0 +1,58 @@
+use worker::*;
+use uuid::Uuid;
+
+fn cors_headers() -> Headers {
+    let mut headers = Headers::new();
+    headers.set("Access-Control-Allow-Origin", "*").unwrap();
+    headers.set("Access-Control-Allow-Methods", "POST, OPTIONS").unwrap();
+    headers.set("Access-Control-Allow-Headers", "Content-Type").unwrap();
+    headers
+}
+
+#[event(fetch)]
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let kv = env.kv("INVITE_CODES")?;
+    let db = env.d1("DB")?;
+    
+    // Handle preflight CORS request
+    if req.method() == Method::Options {
+        return Ok(Response::empty()?.with_headers(cors_headers()));
+    }
+
+    // Ensure it's a POST request
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+
+    // Parse JSON body
+    let body: serde_json::Value = req.json().await?;
+    let invite_code = match body.get("invite_code").and_then(|v| v.as_str()) {
+        Some(code) => code,
+        None => return Response::error("Missing invite code", 400),
+    };
+
+    // Check if invite code exists in KV
+    let is_valid = kv.get(invite_code).text().await?.is_some();
+    if !is_valid {
+        return Response::error("Invalid invite code", 403);
+    }
+
+    // Remove invite code after use
+    kv.delete(invite_code).await?;
+
+    // Generate a UUID token
+    let token = Uuid::new_v4().to_string();
+
+    // Store user session in D1 database
+    let stmt = db.prepare("INSERT INTO users (invite_code, token) VALUES (?, ?)").await?;
+    stmt.bind(&[invite_code.into(), token.clone().into()]).run().await?;
+
+    // Set HttpOnly cookie with the token
+    let mut headers = cors_headers();
+    headers.set(
+        "Set-Cookie",
+        &format!("auth_token={}; HttpOnly; Secure; Path=/", token),
+    )?;
+
+    Ok(Response::ok("Login successful")?.with_headers(headers))
+}
