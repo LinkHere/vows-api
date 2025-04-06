@@ -1,93 +1,165 @@
-use worker::*; use uuid::Uuid; use wasm_bindgen::JsValue; use serde_json::Value;
+use worker::*;
+use serde::{Deserialize, Serialize};
 
-fn cors_headers() -> Headers { let mut headers = Headers::new(); headers.set("Access-Control-Allow-Origin", "http://localhost:5173").unwrap(); headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap(); headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization").unwrap(); headers.set("Access-Control-Allow-Credentials", "true").unwrap(); headers }
-
-#[event(fetch)] pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> { if req.method() == Method::Options { let mut res = Response::empty()?; for (key, value) in cors_headers().entries() { res.headers_mut().set(&key, &value)?; } return Ok(res); }
-
-let router = Router::new()
-    .post_async("/login", |mut req, ctx| async move {
-        let kv = ctx.kv("INVITE_CODES")?;
-        let d1 = ctx.d1("DB")?;
-        let body: Value = req.json().await?;
-        let invite_code = body.get("invite_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        // Validate invite code
-        let kv_list = kv.list().execute().await?;
-        if !kv_list.keys.iter().any(|k| k.name == invite_code) {
-            return Response::error("Invalid invite code", 403);
-        }
-        let token = Uuid::new_v4().to_string();
-        let stmt = d1.prepare("INSERT INTO sessions (invite_code, token) VALUES (?, ?)")
-            .bind(&[JsValue::from(invite_code), JsValue::from(token.clone())])?;
-        stmt.run().await?;
-
-        let base_url = "https://vows-api.clydecreta.workers.dev";
-        let redirect_url = format!("{}/profile", base_url);
-        let mut res = Response::empty()?.with_status(302);
-        res.headers_mut().set("Location", &redirect_url)?;
-        res.headers_mut().set("Set-Cookie", &format!("session={}; HttpOnly; Path=/", token))?;
-        for (key, value) in cors_headers().entries() {
-            res.headers_mut().set(&key, &value)?;
-        }
-        Ok(res)
-        })
-        .get_async("/profile", |req, ctx| async move {
-            let d1 = ctx.d1("DB")?;
-            let token = req.headers().get("Cookie")?
-            .and_then(|c| c.split('=').nth(1).map(String::from));
-
-            match token {
-                Some(t) => {
-                    let stmt = d1.prepare("SELECT invite_code FROM sessions WHERE token = ?")
-                    .bind(&[JsValue::from(t)])?;
-                    let result: Option<serde_json::Value> = stmt.first(None).await?;
-
-                    if let Some(value) = result {
-                        if let Some(invite_code) = value.get("invite_code").and_then(|v| v.as_str()) {
-                            let mut res = Response::ok(format!("Welcome, user with invite code: {}", invite_code))?;
-                            for (key, value) in cors_headers().entries() {
-                                res.headers_mut().set(&key, &value)?;
-                            }
-
-                            return Ok(res);
-                        }
-                    }
-                }
-                None => {}
-            }
-
-            let mut res = Response::error("Unauthorized", 401)?;
-            for (key, value) in cors_headers().entries() {
-                res.headers_mut().set(&key, &value)?;
-            }
-            Ok(res)
-        })
-        .post_async("/logout", |req, ctx| async move {
-            let d1 = ctx.d1("DB")?;
-            let token = req.headers().get("Cookie")?.and_then(|c| c.split('=').nth(1).map(String::from));
-
-        if let Some(t) = token {
-            let stmt = d1.prepare("DELETE FROM sessions WHERE token = ?")
-                .bind(&[JsValue::from(t)])?;
-            stmt.run().await?;
-            let mut res = Response::ok("Logged out")?;
-            res.headers_mut().set("Set-Cookie", "session=; HttpOnly; Path=/; Max-Age=0")?;
-            for (key, value) in cors_headers().entries() {
-                res.headers_mut().set(&key, &value)?;
-            }
-            return Ok(res);
-        }
-        let mut res = Response::error("Not logged in", 400)?;
-        for (key, value) in cors_headers().entries() {
-            res.headers_mut().set(&key, &value)?;
-        }
-        Ok(res)
-    })
-    .run(req, env).await?;
-
-let mut response = router;
-for (key, value) in cors_headers().entries() {
-    response.headers_mut().set(&key, &value)?;
+#[derive(Deserialize)]
+struct InviteRequest {
+    invite_code: String,
 }
-Ok(response)
 
+#[derive(Deserialize, Serialize)]
+struct RsvpForm {
+    invite_code: String,
+    guest_name: String,
+    attending: bool,
+    meal: String,
+    special_requests: Option<String>,
+}
+
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let router = Router::new()
+        // POST: Validate invite code
+        .post_async("/validate-invite", |mut req, ctx| async move {
+            let form: Result<InviteRequest> = req.json().await;
+            let form = match form {
+                Ok(f) => f,
+                Err(_) => {
+                    return Response::from_json(&serde_json::json!({
+                        "status": "error",
+                        "message": "Invalid request format."
+                    })).map_err(Into::into);
+                }
+            };
+
+            let invite_code = &form.invite_code;
+            let kv = ctx.env.kv("INVITE_CODES")?;
+            let value: Option<String> = match kv.get(invite_code).text().await {
+                Ok(val) => val,
+                Err(_) => {
+                    return Response::from_json(&serde_json::json!({
+                        "status": "error",
+                        "message": "Error retrieving invite code."
+                    })).map_err(Into::into);
+                }
+            };
+
+            let response = match value {
+                Some(val) if val == "valid" => serde_json::json!({
+                    "status": "success",
+                    "message": "Invite code is valid. Please submit your RSVP."
+                }),
+                Some(_) => serde_json::json!({
+                    "status": "error",
+                    "message": "This invite code has already been used or is invalid."
+                }),
+                None => serde_json::json!({
+                    "status": "error",
+                    "message": "Invalid invite code."
+                })
+            };
+
+            Response::from_json(&response).map_err(Into::into)
+        })
+        
+        .post_async("/submit-rsvp", |mut req, ctx| async move {
+    // Parse the incoming request body to get the RSVP form.
+    let rsvp_form: Result<RsvpForm> = req.json().await;
+    let rsvp_form = match rsvp_form {
+        Ok(f) => f,
+        Err(_) => {
+            return Response::from_json(&serde_json::json!({
+                "status": "error",
+                "message": "Invalid RSVP format."
+            })).map_err(Into::into);
+        }
+    };
+
+    // Use invite_code from the form as the unique identifier for the RSVP.
+    let invite_code = &rsvp_form.invite_code;  // Now using invite_code instead of guest_name
+    let kv = ctx.env.kv("RSVP_DETAILS")?;
+
+    // Check if an RSVP entry already exists for this invite_code.
+    let existing_rsvp: Option<String> = match kv.get(invite_code).text().await {
+        Ok(val) => val,
+        Err(_) => {
+            return Response::from_json(&serde_json::json!({
+                "status": "error",
+                "message": "Error checking RSVP status."
+            })).map_err(Into::into);
+        }
+    };
+
+    // Check if the RSVP already exists or not.
+    let json_response = match existing_rsvp {
+        Some(_) => {
+            // If the RSVP already exists, update it.
+            match kv.put(invite_code, serde_json::to_string(&rsvp_form)?)?.execute().await {
+                Ok(_) => serde_json::json!({
+                    "status": "success",
+                    "message": "RSVP updated successfully!"
+                }),
+                Err(_) => serde_json::json!({
+                    "status": "error",
+                    "message": "Error saving RSVP."
+                }),
+            }
+        },
+        None => {
+            // If the RSVP doesn't exist, store it.
+            match kv.put(invite_code, serde_json::to_string(&rsvp_form)?)?.execute().await {
+                Ok(_) => serde_json::json!({
+                    "status": "success",
+                    "message": "RSVP submitted successfully!"
+                }),
+                Err(_) => serde_json::json!({
+                    "status": "error",
+                    "message": "Error saving RSVP."
+                }),
+            }
+        }
+    };
+
+    // Return the response.
+    Response::from_json(&json_response).map_err(Into::into)
+})
+
+
+        // GET: View profile for invite code
+        .get_async("/profile/:invite_code", |_req, ctx| async move {
+            let invite_code = ctx.param("invite_code").ok_or_else(|| worker::Error::RustError("Missing invite_code".into()))?.to_string();
+            let kv = ctx.env.kv("RSVP_DETAILS")?;
+
+            let guest_data: Option<String> = match kv.get(&invite_code).text().await {
+                Ok(val) => val,
+                Err(_) => {
+                    return Response::from_json(&serde_json::json!({
+                        "status": "error",
+                        "message": "Error retrieving guest data."
+                    })).map_err(Into::into);
+                }
+            };
+
+            match guest_data {
+                Some(data) => {
+                    let profile: RsvpForm = match serde_json::from_str(&data) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Response::from_json(&serde_json::json!({
+                                "status": "error",
+                                "message": "Error deserializing profile data."
+                            })).map_err(Into::into);
+                        }
+                    };
+                    Response::from_json(&profile).map_err(Into::into)
+                },
+                None => {
+                    Response::from_json(&serde_json::json!({
+                        "status": "error",
+                        "message": "Profile not found."
+                    })).map_err(Into::into)
+                }
+            }
+        });
+
+    router.run(req, env).await
 }
